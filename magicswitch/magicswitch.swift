@@ -11,7 +11,7 @@
 import Foundation
 import IOBluetooth
 
-let toolVersion = "1.3"
+let toolVersion = "1.4"
 
 let defaultPatterns = ["magic mouse", "magic keyboard", "magic trackpad"]
 
@@ -128,6 +128,73 @@ func cmdRadio(_ arg: String?) -> Int32 {
     default:
         note("radio takes: on | off | status"); return 64
     }
+}
+
+/// Dump everything IOBluetooth knows, so we can tell whether these devices are
+/// classic BR/EDR (pageable, grab can work) or LE (they are not, and never will
+/// be — IOBluetooth's openConnection has no LE path).
+func cmdProbe(_ patterns: [String]) -> Int32 {
+    let targets = patterns.isEmpty ? pairedDevices() : resolve(patterns)
+    guard !targets.isEmpty else { return notFound(patterns) }
+
+    if let on = bluetoothPowerIsOn() { print("controller power: \(on ? "on" : "off")\n") }
+
+    for d in targets {
+        let cod = d.classOfDevice
+        let services = (d.services as? [IOBluetoothSDPServiceRecord])?.count ?? 0
+        print("\(d.name ?? "(unnamed)")  \(d.addressString ?? "??")")
+        print("  paired:         \(d.isPaired())")
+        print("  connected:      \(d.isConnected())")
+        print("  classOfDevice:  0x\(String(format: "%06X", cod))")
+        print("  major/minor:    \(d.deviceClassMajor) / \(d.deviceClassMinor)")
+        print("  SDP services:   \(services)")
+
+        // A classic HID peripheral reports a non-zero class of device (a mouse
+        // is major 5 / minor 0x80, a keyboard major 5 / minor 0x40) and carries
+        // SDP records. An LE-only device shows up with neither.
+        if cod == 0 && services == 0 {
+            print("  transport:      LE (no class-of-device, no SDP)")
+            print("                  → openConnection() cannot reach this. Use `wait`.")
+        } else if d.deviceClassMajor == 5 {
+            print("  transport:      classic BR/EDR HID — pageable, grab should work")
+        } else {
+            print("  transport:      unclear — classic fields present but not HID-shaped")
+        }
+        print("")
+    }
+    return 0
+}
+
+/// Passive counterpart to grab: never pages, just waits for macOS to bring the
+/// device up on its own. This is the only thing that works for LE HID, where
+/// the system HID stack owns reconnection and there is no public API to force it.
+func cmdWait(_ patterns: [String], timeout: Double) -> Int32 {
+    let targets = resolve(patterns)
+    guard !targets.isEmpty else { return notFound(patterns) }
+
+    let forever = timeout <= 0
+    let deadline = Date().addingTimeInterval(forever ? 0 : timeout)
+    var reported = Set<String>()
+
+    note("Waiting for macOS to pick these up on its own (no paging). "
+       + "Wake the device — move the mouse, tap a key.")
+
+    while forever || Date() < deadline {
+        var allUp = true
+        for d in targets {
+            let key = d.addressString ?? d.name ?? "?"
+            if d.isConnected() {
+                if reported.insert(key).inserted { print("connected      \(label(d))") }
+            } else {
+                allUp = false
+            }
+        }
+        if allUp { return 0 }
+        Thread.sleep(forTimeInterval: 0.5)
+    }
+
+    for d in targets where !d.isConnected() { print("still down     \(label(d))") }
+    return 1
 }
 
 func cmdList() -> Int32 {
@@ -339,6 +406,10 @@ USAGE
   magicswitch release [--radio-off S] [--delay S] [device …]
   magicswitch grab    [--timeout S] [--page S] [device …]
   magicswitch radio   [on | off | status]
+  magicswitch probe   [device …]      what transport is this device really on?
+  magicswitch wait    [--timeout S] [device …]
+                                      passive: don't page, just wait for macOS
+                                      to connect it. The LE path.
 
 DEVICE
   A MAC address (aa:bb:cc:dd:ee:ff) or any substring of the device name.
@@ -415,6 +486,10 @@ case "list":    exit(cmdList())
 case "status":  exit(cmdStatus(devices))
 case "radio":
     exit(cmdRadio(devices.first))
+case "probe":
+    exit(cmdProbe(devices))
+case "wait":
+    exit(cmdWait(devices, timeout: timeout))
 case "release", "disconnect", "drop":
     exit(cmdRelease(devices, delay: delay, hold: hold, radioOff: radioOff))
 case "grab", "connect", "take":
