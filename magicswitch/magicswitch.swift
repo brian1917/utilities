@@ -11,7 +11,7 @@
 import Foundation
 import IOBluetooth
 
-let toolVersion = "1.4"
+let toolVersion = "1.5"
 
 let defaultPatterns = ["magic mouse", "magic keyboard", "magic trackpad"]
 
@@ -296,6 +296,72 @@ func cmdRelease(_ patterns: [String], delay: Double, hold: Double, radioOff: Dou
     return failed.isEmpty ? 0 : 1
 }
 
+// MARK: - Force-pair
+//
+// openConnection() just pages an existing bond. IOBluetoothDevicePair re-runs
+// Simple Secure Pairing and re-establishes the link key, which is what actually
+// pulls a Magic peripheral away from whichever Mac had it last.
+//
+// This is asynchronous and delegate-driven: it needs a running CFRunLoop, which
+// a plain Thread.sleep loop does not provide. Hence the RunLoop pumping below.
+
+final class PairHandler: NSObject, IOBluetoothDevicePairDelegate {
+    let device: IOBluetoothDevice
+    private var pairer: IOBluetoothDevicePair?
+    var finished = false
+    var result: IOReturn = kIOReturnError
+
+    init(device: IOBluetoothDevice) {
+        self.device = device
+        super.init()
+    }
+
+    func start() -> Bool {
+        guard let p = IOBluetoothDevicePair(device: device) else { return false }
+        pairer = p
+        p.delegate = self
+        return p.start() == kIOReturnSuccess
+    }
+
+    func stop() { pairer?.stop() }
+
+    // Magic peripherals pair "Just Works" — no PIN, no numeric compare shown to
+    // a user. Auto-accept so this stays headless.
+    func devicePairingUserConfirmationRequest(_ sender: Any!, numericValue: BluetoothNumericValue) {
+        pairer?.replyUserConfirmation(true)
+    }
+
+    func devicePairingPINCodeRequest(_ sender: Any!) {
+        // Nothing meaningful to supply; let it time out rather than guess.
+    }
+
+    func devicePairingFinished(_ sender: Any!, error: IOReturn) {
+        result = error
+        finished = true
+    }
+
+    func devicePairingConnecting(_ sender: Any!) {}
+    func devicePairingStarted(_ sender: Any!) {}
+}
+
+/// Force-pair one device, pumping the run loop until it settles.
+func forcePair(_ d: IOBluetoothDevice, timeout: Double, verbose: Bool) -> IOReturn {
+    let handler = PairHandler(device: d)
+    guard handler.start() else {
+        if verbose { note("  IOBluetoothDevicePair refused to start for \(d.name ?? "?")") }
+        return kIOReturnError
+    }
+    let deadline = Date().addingTimeInterval(timeout)
+    while !handler.finished && Date() < deadline {
+        RunLoop.current.run(mode: .default, before: Date().addingTimeInterval(0.2))
+    }
+    if !handler.finished {
+        handler.stop()
+        return kIOReturnTimeout
+    }
+    return handler.result
+}
+
 /// Open the link from this Mac. Retries until every target is connected or
 /// the timeout expires (timeout 0 = wait forever).
 ///
@@ -303,7 +369,8 @@ func cmdRelease(_ patterns: [String], delay: Double, hold: Double, radioOff: Dou
 /// bare `openConnection()` pages for ~5 s, which is usually shorter than the
 /// interval a sleeping Magic device waits between page scans, so the call
 /// returns kIOReturnTimeout before the device ever listens. 0x8000 ≈ 20 s.
-func cmdGrab(_ patterns: [String], timeout: Double, pageSeconds: Double, verbose: Bool) -> Int32 {
+func cmdGrab(_ patterns: [String], timeout: Double, pageSeconds: Double,
+             usePairing: Bool, verbose: Bool) -> Int32 {
     var pending = resolve(patterns)
     guard !pending.isEmpty else { return notFound(patterns) }
 
@@ -335,8 +402,9 @@ func cmdGrab(_ patterns: [String], timeout: Double, pageSeconds: Double, verbose
 
     // Say this BEFORE the first blocking page, not after: it's an instruction,
     // and it's useless once the window has already closed.
-    note(">>> Nudge the mouse and tap a key NOW. A Magic device only listens for "
-       + "pages while it's awake. <<<")
+    note(usePairing
+        ? ">>> Force-pairing. Nudge the mouse and tap a key NOW. <<<"
+        : ">>> Nudge the mouse and tap a key NOW. A Magic device only listens for pages while it's awake. <<<")
 
     let deadline = Date().addingTimeInterval(forever ? 0 : budget)
     var attempts = 0
@@ -350,9 +418,14 @@ func cmdGrab(_ patterns: [String], timeout: Double, pageSeconds: Double, verbose
                 print("connected      \(label(d))")
                 continue
             }
-            let result = d.openConnection(nil,
+            let result: IOReturn
+            if usePairing {
+                result = forcePair(d, timeout: pageSeconds, verbose: verbose)
+            } else {
+                result = d.openConnection(nil,
                                           withPageTimeout: pageTimeout,
                                           authenticationRequired: true)
+            }
             if result == kIOReturnSuccess && d.isConnected() {
                 print("connected      \(label(d))")
                 continue
@@ -431,6 +504,11 @@ OPTIONS
   --page S      grab: how long each connect attempt pages for, in seconds.
                 Costs this much PER DEVICE per round. Default 6 — short enough
                 to retry often while you're waking the device by hand.
+  --pair        grab: force-pair via IOBluetoothDevicePair (DEFAULT). Re-runs
+                Simple Secure Pairing, which is what actually drags a Magic
+                peripheral off the Mac that had it.
+  --page-only   grab: old behaviour — just page an existing bond. Kept for
+                comparison; it does not win the device back.
   --verbose     print per-attempt IOReturn codes.
 
 EXIT CODES
@@ -454,6 +532,7 @@ var hold: Double = 12
 var timeout: Double = 45
 var pageSeconds: Double = 6
 var radioOff: Double? = nil
+var usePairing = true          // force-pair is the path that actually works
 var verbose = false
 var devices: [String] = []
 
@@ -473,6 +552,8 @@ while i < args.count {
     case "--timeout": timeout = value("--timeout")
     case "--page":    pageSeconds = value("--page")
     case "--radio-off": radioOff = value("--radio-off")
+    case "--pair":    usePairing = true
+    case "--page-only": usePairing = false
     case "--verbose", "-V": verbose = true
     default:
         if a.hasPrefix("--") { note("Unknown option \(a)"); exit(64) }
@@ -493,7 +574,8 @@ case "wait":
 case "release", "disconnect", "drop":
     exit(cmdRelease(devices, delay: delay, hold: hold, radioOff: radioOff))
 case "grab", "connect", "take":
-    exit(cmdGrab(devices, timeout: timeout, pageSeconds: pageSeconds, verbose: verbose))
+    exit(cmdGrab(devices, timeout: timeout, pageSeconds: pageSeconds,
+                 usePairing: usePairing, verbose: verbose))
 default:
     note("Unknown command '\(command)'.\n")
     print(usage)
